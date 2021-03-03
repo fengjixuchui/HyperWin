@@ -11,7 +11,29 @@
 #include <win_kernel/memory_manager.h>
 #include <bios/apic.h>
 #include <bios/bios_os_loader.h>
-#include <guest_communication/communication_block.h>
+
+STATUS DfltModuleInitializeAllCores(PMODULE module)
+{
+    MdlInitModule(module);
+    MdlSetModuleName(module, "Default Module");
+    MdlRegisterVmExitHandler(module, EXIT_REASON_MSR_READ, DfltHandleMsrRead);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_MSR_WRITE, DfltHandleMsrWrite);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_INVALID_GUEST_STATE, DfltHandleInvalidGuestState);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_XSETBV, DfltEmulateXSETBV);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_CPUID, DfltHandleCpuId);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_CR_ACCESS, DfltHandleCrAccess);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_EPT_VIOLATION, DfltHandleEptViolation);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_VMCALL, DfltHandleVmCall);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_MSR_LOADING, DfltHandleInvalidMsrLoading);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_MCE_DURING_VMENTRY, DfltHandleMachineCheckFailure);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_TRIPLE_FAULT, DfltHandleTripleFault);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_INIT, DfltHandleApicInit);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_SIPI, DfltHandleApicSipi);
+    MdlRegisterVmExitHandler(module, EXIT_REASON_EXCEPTION_NMI, DfltHandleException);
+    Print("Successfully registered default module\n");
+
+    return STATUS_SUCCESS;
+}
 
 STATUS DfltHandleCrAccess(IN PCURRENT_GUEST_STATE data, IN PMODULE module)
 {
@@ -213,12 +235,6 @@ STATUS DfltHandleVmCall(IN PCURRENT_GUEST_STATE data, IN PMODULE module)
         __vmwrite(GUEST_CS_SELECTOR, (data->currentCPU->sharedData->int15Segment) >> 4);
         return STATUS_SUCCESS;
     }
-    else if(regs->rax == VMCALL_COMMUNICATION_BLOCK)
-    {
-        regs->rip += vmread(VM_EXIT_INSTRUCTION_LEN);
-        ComHandleVmCallCommunication(data);
-        return STATUS_SUCCESS;
-    } 
 
     return STATUS_UNKNOWN_VMCALL;
 }
@@ -255,30 +271,13 @@ STATUS DfltHandleMsrWrite(IN PCURRENT_GUEST_STATE data, IN PMODULE module)
 STATUS DfltHandleCpuId(IN PCURRENT_GUEST_STATE data, IN PMODULE module)
 {
     PREGISTERS regs;
-    QWORD eax, ebx, ecx, edx, leaf, subleaf, physicalCommunication;
+    QWORD eax, ebx, ecx, edx, leaf, subleaf;
 
     regs = &data->guestRegisters;
     leaf = regs->rax;
     subleaf = regs->rcx;
     regs->rip += vmread(VM_EXIT_INSTRUCTION_LEN);
-    if(leaf == CPUID_GET_READ_PIPE)
-    {
-        physicalCommunication = data->currentCPU->sharedData->readPipe.physicalAddress;
-        Print("Received a request for read pipe base address: %8\n", physicalCommunication);
-        regs->rdx = physicalCommunication >> 32;
-        regs->rax = physicalCommunication & 0xffffffffULL;
 
-        return STATUS_SUCCESS;
-    }
-    else if(leaf == CPUID_GET_WRITE_PIPE)
-    {
-        physicalCommunication = data->currentCPU->sharedData->writePipe.physicalAddress;
-        Print("Received a request for write pipe base address: %8\n", physicalCommunication);
-        regs->rdx = physicalCommunication >> 32;
-        regs->rax = physicalCommunication & 0xffffffffULL;
-
-        return STATUS_SUCCESS;
-    }
     __cpuid(leaf, subleaf, &eax, &ebx, &ecx, &edx);
     if (leaf == 1)
     {
@@ -305,10 +304,12 @@ STATUS DfltHandleCpuId(IN PCURRENT_GUEST_STATE data, IN PMODULE module)
             edx = 0;
         }
     }
+
     regs->rax = eax;
     regs->rbx = ebx;
     regs->rcx = ecx;
-    regs->rdx = edx;    
+    regs->rdx = edx;
+
     return STATUS_SUCCESS;
 }
 

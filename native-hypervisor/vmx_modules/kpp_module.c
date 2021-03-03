@@ -8,25 +8,41 @@
 #include <intrinsics.h>
 #include <vmx_modules/hooking_module.h>
 #include <vmm/memory_manager.h>
+#include <vmm/exit_reasons.h>
 
-STATUS KppModuleInitializeAllCores(IN PSHARED_CPU_DATA sharedData, IN PMODULE module, IN PGENERIC_MODULE_DATA initData)
+STATUS KppModuleInitializeAllCores(IN PMODULE module)
 {
     PKPP_MODULE_DATA extension;
+    PSHARED_CPU_DATA sharedData;
 
+    sharedData = VmmGetVmmStruct()->currentCPU->sharedData;
     PrintDebugLevelDebug("Starting initialization of KPP module for all cores\n");
+    // Init module & name
+    MdlInitModule(module);
+    MdlSetModuleName(module, KPP_MODULE_NAME);
+    // Register VM-Exit handlers
+    MdlRegisterVmExitHandler(module, EXIT_REASON_EPT_VIOLATION, KppHandleEptViolation);
+    MdlRegisterModule(module);
+    // Allocate space for module extension
     sharedData->heap.allocate(&sharedData->heap, sizeof(KPP_MODULE_DATA), &module->moduleExtension);
+    // Init extension
     HwSetMemory(module->moduleExtension, 0, sizeof(KPP_MODULE_DATA));
     extension = module->moduleExtension;
     SetInit(&extension->addressSet, BASIC_HASH_LEN, BasicHashFunction);
     ListCreate(&extension->entriesList); 
     PrintDebugLevelDebug("Shared cores data successfully initialized for KPP module\n");
+    
     return STATUS_SUCCESS;
 }
 
-STATUS KppModuleInitializeSingleCore(IN PSINGLE_CPU_DATA data)
+STATUS KppModuleInitializeSingleCore(PMODULE module)
 {
+    PSINGLE_CPU_DATA data;
+
+    data = VmmGetVmmStruct()->currentCPU;
     PrintDebugLevelDebug("Starting initialization of KPP module on core #%d\n", data->coreIdentifier);
     PrintDebugLevelDebug("Finished initialization of KPP module on core #%d\n", data->coreIdentifier);
+    
     return STATUS_SUCCESS;
 }
 
@@ -34,37 +50,33 @@ STATUS KppAddNewEntry(IN QWORD guestPhysicalAddress, IN QWORD hookedInstructionL
 {
     PKPP_ENTRY_CONTEXT kppContext;
     PHEAP heap;
-    STATUS status;
     static PMODULE module;
     PKPP_MODULE_DATA kppData;
     PSHARED_CPU_DATA shared;
+    STATUS status = STATUS_SUCCESS;
 
     shared = VmmGetVmmStruct()->currentCPU->sharedData;
     if(!module)
-        SUCCESS_OR_RETURN(MdlGetModuleByName(&module, KPP_MODULE_NAME));
+        SUCCESS_OR_CLEANUP(MdlGetModuleByName(&module, KPP_MODULE_NAME));
     
     heap = &shared->heap;
     kppData = (PKPP_MODULE_DATA)module->moduleExtension;
-    if((status = heap->allocate(heap, sizeof(KPP_ENTRY_CONTEXT), &kppContext)) != STATUS_SUCCESS)
-    {
-        Print("Could not allocate memory for a new KPP context\n");
-        return status;
-    }
+    SUCCESS_OR_CLEANUP(heap->allocate(heap, sizeof(KPP_ENTRY_CONTEXT), &kppContext));
     kppContext->hookedInstructionAddress = guestPhysicalAddress;
     kppContext->hookedInstructionLength = hookedInstructionLength;
-    HwCopyMemory(kppContext->hookedInstrucion, hookedInstruction, hookedInstructionLength);    
-    if((status = ListInsert(&kppData->entriesList, kppContext)) != STATUS_SUCCESS)
-    {
-        Print("Could not insert a new KPP context to list of contexts\n");
-        return status;
-    }
+    HwCopyMemory(kppContext->hookedInstrucion, hookedInstruction, hookedInstructionLength);
+    SUCCESS_OR_CLEANUP(ListInsert(&kppData->entriesList, kppContext));
     // Save the address in the addresses set
     SetInsert(&kppData->addressSet, ALIGN_DOWN((QWORD)guestPhysicalAddress, PAGE_SIZE));
     // Mark the page as unreadable & unwritable
     for(QWORD i = 0; i < shared->numberOfCores; i++)
         VmmUpdateEptAccessPolicy(shared->cpuData[i], ALIGN_DOWN((QWORD)guestPhysicalAddress, PAGE_SIZE), 
             PAGE_SIZE, EPT_EXECUTE);
-    return STATUS_SUCCESS;
+
+cleanup:
+    if(status && kppContext)
+        heap->deallocate(heap, kppContext);
+    return status;
 }
 
 STATUS KppRemoveEntry(IN QWORD guestPhysicalAddress)
@@ -103,7 +115,7 @@ STATUS KppRemoveEntry(IN QWORD guestPhysicalAddress)
     Print("Found the entry, removing it from KPP's list...\n");
     ListRemove(&kppData->entriesList, (QWORD)kppContext);
     // Deallocate the memory
-    SUCCESS_OR_RETURN(heap->deallocate(heap, kppContext));
+    heap->deallocate(heap, kppContext);
     return STATUS_SUCCESS;
 }
 
@@ -117,7 +129,8 @@ BOOL KppCheckIfAddressContainsInstruction(IN PKPP_MODULE_DATA kppData, IN QWORD 
     while(kppEntry)
     {
         kppContext = (PKPP_ENTRY_CONTEXT)kppEntry->data;
-        if(address - kppContext->hookedInstructionLength <= readLength)
+        if(kppContext->hookedInstructionAddress <= address
+            && ((kppContext->hookedInstructionAddress + kppContext->hookedInstructionLength) >= address))
         {
             *before = FALSE;
             *entry = kppContext;
@@ -125,7 +138,7 @@ BOOL KppCheckIfAddressContainsInstruction(IN PKPP_MODULE_DATA kppData, IN QWORD 
             return TRUE;
         }
         else if((address <= kppContext->hookedInstructionAddress)
-         && ((address + readLength) >= kppContext->hookedInstructionAddress))
+         && (kppContext->hookedInstructionAddress <= (address + readLength)))
         {
             *before = TRUE;
             *entry = kppContext;
@@ -149,6 +162,7 @@ VOID KppBuildResult(OUT PVOID val, IN QWORD guestPhysical, IN QWORD readLength,
         &entry, &ext))
     {
         // The hidden instruction is a prefix of the current checked instruction
+        // OR the hidden instruction contains all of the checked instruction
         if(!isBefore)
         {
             // ext = offset from the beggining of the hidden instruction
@@ -160,11 +174,23 @@ VOID KppBuildResult(OUT PVOID val, IN QWORD guestPhysical, IN QWORD readLength,
                         - ext), readLength - (entry->hookedInstructionLength - ext));
         }
         // The hidden instruction is a suffix of the current checked instruction
+        // OR the checked instruction contains the hidden instruction 
         else
         {
             // ext = the number of bytes before the beggining of the hidden instruction
+            // Copy the beginning
             HwCopyMemory(val, hostVirtualAddress, ext);
-            HwCopyMemory((BYTE_PTR)val + ext, entry->hookedInstrucion, readLength - ext);
+            // Copy the replaced instruction itself
+            if(readLength > ext)
+            {
+                HwCopyMemory((BYTE_PTR)val + ext, entry->hookedInstrucion, readLength - ext 
+                    <= entry->hookedInstructionLength ? readLength - ext : entry->hookedInstructionLength);
+                // Copy the rest of the instruction, if we need to
+                if(readLength - ext > entry->hookedInstructionLength)
+                    HwCopyMemory((BYTE_PTR)val + ext + entry->hookedInstructionLength, 
+                                hostVirtualAddress + ext + entry->hookedInstructionLength,
+                                readLength - ext - entry->hookedInstructionLength);
+            }
         }      
     }
     else
@@ -230,11 +256,13 @@ STATUS KppEmulatePatchGuardAction(IN PKPP_MODULE_DATA kppData, IN QWORD address,
     }
     else if((instructionLength == 3 && inst[0] == 0x49 && inst[1] == 0x33 && inst[2] == 0x18)
         || (instructionLength == 4 && inst[0] == 0x49 && inst[1] == 0x33 && inst[2] == 0x58 && inst[3] == 0x8)
-        || (instructionLength == 3 && inst[0] == 0x48 && inst[1] == 0x33 && inst[2] == 0x1f))
+        || (instructionLength == 3 && inst[0] == 0x48 && inst[1] == 0x33 && inst[2] == 0x1f)
+        || (instructionLength == 3 && inst[0] == 0x49 && inst[1] == 0x33 && inst[2] == 0x19))
     {
         // xor rbx,QWORD PTR [r8]
         // xor rbx,QWORD PTR [r8+0x8]
         // xor rbx,QWORD PTR [rdi]
+        // xor rbx,QWORD PTR [r9]
         QWORD val;
         KppBuildResult(&val, address, 8, kppData);
         regs->rbx ^= val;
@@ -280,6 +308,21 @@ STATUS KppEmulatePatchGuardAction(IN PKPP_MODULE_DATA kppData, IN QWORD address,
         KppBuildResult(&val, address, 8, kppData);
         regs->rbx = val;
     }
+    else if(instructionLength == 4 && inst[0] == 0x0f && inst[1] == 0x10 && inst[2] == 0x04 && inst[3] == 0x11)
+    {
+        // movups xmm0, XMMWORD PTR [rcx+rdx*1]
+        BYTE val[16];
+        KppBuildResult(&val, address, 16, kppData);
+        __movups_xmm0(val);
+    }
+    // Kernel-debugging area
+    else if(instructionLength == 3 && inst[0] == 0x41 && inst[1] == 0x88 && inst[2] == 0x02)
+    {
+        // mov BYTE PTR [r10],al
+        BYTE_PTR hostVirtual = WinMmTranslateGuestPhysicalToHostVirtual(address);
+        *hostVirtual = (BYTE)(regs->rax & 0xff);
+    }
+    
     else
     {
         Print("New KPP instruction found at %8: %.b\n", address, instructionLength, inst);
@@ -301,3 +344,5 @@ STATUS KppHandleEptViolation(IN PCURRENT_GUEST_STATE data, IN PMODULE module)
         return STATUS_VM_EXIT_NOT_HANDLED;
     return KppEmulatePatchGuardAction(kppData, address, instructionLength);
 }
+
+REGISTER_MODULE(KppModuleInitializeAllCores, KppModuleInitializeSingleCore, kpp);

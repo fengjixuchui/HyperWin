@@ -136,16 +136,22 @@ STATUS ObjGetDeviceObjectField(IN QWORD object, IN QWORD field, OUT PVOID value)
     {
         case DEVICE_OBJECT_DRIVER_OBJECT:
             return WinMmCopyGuestMemory(value, object + field, sizeof(QWORD));
+        case DEVICE_OBJECT_FLAGS:
+            return WinMmCopyGuestMemory(value, object + field, sizeof(DWORD));
     }
 }
+
 STATUS ObjGetDriverObjectField(IN QWORD object, IN QWORD field, OUT PVOID value)
 {
     switch(field)
     {
         case DRIVER_OBJECT_NAME:
             return WinMmCopyGuestMemory(value, object + field, sizeof(WIN_KERNEL_UNICODE_STRING));
+        case DRIVER_OBJECT_FAST_IO_DISPATCH:
+            return WinMmCopyGuestMemory(value, object + field, sizeof(QWORD));
     }
 }
+
 STATUS ObjGet_VPB_field(IN QWORD object, IN QWORD field, OUT PVOID value)
 {
     switch(field)
@@ -168,6 +174,58 @@ STATUS ObjGet_FILE_OBJECT_field(IN QWORD object, IN QWORD field, OUT PVOID value
     }
 }
 
+STATUS ObjGet_IRP_field(IN QWORD object, IN QWORD field, OUT PVOID value)
+{
+    switch(field)
+    {
+        case IRP_TAIL_IO_STACK_LOCATION:
+        case IRP_IO_STATUS:
+        case IRP_MDL:
+        case IRP_USER_IOSB:
+        case IRP_USER_BUFFER:
+        case IRP_SYSTEM_BUFFER:
+            return WinMmCopyGuestMemory(value, object + field, sizeof(QWORD));
+        case IRP_FLAGS:
+            return WinMmCopyGuestMemory(value, object + field, sizeof(DWORD));
+    }
+}
+
+STATUS ObjGet_IO_STACK_LOCATION_field(IN QWORD object, IN QWORD field, OUT PVOID value)
+{
+    switch(field)
+    {
+        case IO_STACK_LOCATION_FILE_OBJECT:
+            return WinMmCopyGuestMemory(value, object + field, sizeof(QWORD));
+    }
+}
+
+STATUS ObjGet_MDL_field(IN QWORD object, IN QWORD field, OUT PVOID value)
+{
+    switch(field)
+    {
+        case MDL_SYSTEM_VA:
+            return WinMmCopyGuestMemory(value, object + field, sizeof(QWORD));
+    }
+}
+
+STATUS ObjGet_IO_STATUS_BLOCK_field(IN QWORD object, IN QWORD field, OUT PVOID value)
+{
+    switch(field)
+    {
+        case IO_STATUS_BLOCK_INFORMATION:
+            return WinMmCopyGuestMemory(value, object + field, sizeof(QWORD));
+    }
+}
+
+STATUS ObjGet_FAST_IO_DISPATCH_field(IN QWORD object, IN QWORD field, OUT PVOID value)
+{
+    switch(field)
+    {
+        case FAST_IO_DISPATCH_FAST_IO_READ:
+            return WinMmCopyGuestMemory(value, object + field, sizeof(QWORD));
+    }
+}
+
 STATUS ObjGetObjectField(IN BYTE objectType, IN QWORD object, IN QWORD field, OUT PVOID value)
 {
     switch(objectType)
@@ -184,6 +242,16 @@ STATUS ObjGetObjectField(IN BYTE objectType, IN QWORD object, IN QWORD field, OU
             return ObjGetDriverObjectField(object, field, value);
         case VPB:
             return ObjGet_VPB_field(object, field, value);
+        case IRP:
+            return ObjGet_IRP_field(object, field, value);
+        case IO_STACK_LOCATION:
+            return ObjGet_IO_STACK_LOCATION_field(object, field, value);
+        case MDL:
+            return ObjGet_MDL_field(object, field, value);
+        case IO_STATUS_BLOCK:
+            return ObjGet_IO_STATUS_BLOCK_field(object, field, value);
+        case FAST_IO_DISPATCH:
+            return ObjGet_FAST_IO_DISPATCH_field(object, field, value);
         default:
         {
             Print("Unsupported object type!\n");
